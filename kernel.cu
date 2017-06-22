@@ -239,14 +239,14 @@ int main(){
 			}
 		}
 		iterationNum++;
-		print_matrix(centersMatrix, numCentroids, numAttributes);
+		
 
 	} while(iterationNum<100 && !hasConverged(centersMatrix, oldCentersMatrix, numCentroids, numAttributes));
 	int stop_s = clock();
 	std::cout << "time: " << (stop_s - start_s) / double(CLOCKS_PER_SEC) << std::endl;
 	// prova a vedere cosa succede se non svuoti le memorie del device di quei campi che restano uguali (tipo i points) e se non glieli ripassi, se va uguale risparmi tempo
 
-	
+	print_matrix(centersMatrix, numCentroids, numAttributes);
 	cudaFree(devicePtsMatrix);
 	free(ptsMatrix);
 	free(centersMatrix);
