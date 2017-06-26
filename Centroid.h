@@ -13,20 +13,18 @@ public:
 
 	int ID;
 	int numAttributes;
-	double* attributes;
+	float* attributes;
 	int pointsLength;
-	Point* centroidPoints = new Point[8];
 
 	Centroid(){
 
 	}
 
-	Centroid(int id, int numAttribs, double* attribs){
+	Centroid(int id, int numAttribs, float* attribs){
 		ID = id;
 		attributes = attribs;
 		numAttributes = numAttribs;
 		pointsLength = 0;
-		centroidPoints = {};
 		
 	}
 

@@ -35,7 +35,7 @@ void print_matrix(int* matrix, int rows, int cols) {
 	}
 	printf("\n");
 }
-void print_matrix(double* matrix, int rows, int cols) {
+void print_matrix(float* matrix, int rows, int cols) {
 	for (int i = 0; i < rows; i++) {
 		for (int j = 0; j < cols; j++) {
 			printf("%lf ", matrix[i * cols + j]);
@@ -44,58 +44,69 @@ void print_matrix(double* matrix, int rows, int cols) {
 	}
 	printf("\n");
 }
-void copy_matrix(double* original, double*copy, int rows, int cols){
+void copy_matrix(float* original, float*copy, int rows, int cols){
 	for (int i = 0; i < rows; i++) {
 		for (int j = 0; j < cols; j++) {
 			copy[i*cols + j] = original[i*cols + j];
 		}
 	}
 }
-bool hasConverged(double* newCentroids, double*oldCentroids, int rows, int cols){
-	float tolerance = 0.001;
-	for (int i = 0; i < rows; i++) {
-		for (int j = 0; j < cols; j++) {
-			if (abs(oldCentroids[i*cols + j] - newCentroids[i*cols + j]) > tolerance){
-				return false;
-			}
-		}
-	}
+bool hasConverged(int numPtsChanged, int numPts, int toleratedFraction){
+	printf("\nsoglia: %d", numPts / toleratedFraction);
+	if (numPtsChanged > numPts / toleratedFraction)
+		return false;
 	return true;
+
 }
 
-__global__ void registerPointsToCentroid(double* points, double* centroids, int* linkMatrix, int numPoints, int numCentroids, int numAttributes){
+__global__ void registerPointsToCentroid(float* points, float* centroids, int* linkMatrix, int numPoints, int numCentroids, int numAttributes, int centroidTilingSize){
 	int numThread = blockIdx.x * blockDim.x + threadIdx.x;
 	
-	extern __shared__ double sharedCentroids[];
+	extern __shared__ float sharedCentroids[];
 
 	if (numThread < numPoints){//allora vuol dire che il thread corrisponde ad un Point in memoria
 
-		double minDist = DBL_MAX;
+		float minDist = FLT_MAX;
 		int closerCentroidID;
-		double currentDist;
+		float currentDist = 0.0;
 
-		for (int i = 0; i < numCentroids; i++){ //itero per ogni centroide
-			currentDist = 0.0;
-
-			if (threadIdx.x == 0){
-				for (int j = 0; j < numAttributes; j++){
-					sharedCentroids[j] = centroids[i*numAttributes + j];
-				}	
+		for (int i = 0; i < floor(( (double)numCentroids / (double)centroidTilingSize )) ; i++){ //itero per ogni centroide
+			//tiling dei centroidi----------------------------------------------------------------------------------------------
+			if (threadIdx.x < centroidTilingSize*numAttributes){
+				sharedCentroids[threadIdx.x] = centroids[i*centroidTilingSize*numAttributes + threadIdx.x];
 			}
 			__syncthreads();
-			for (int j = 0; j < numAttributes; j++){//riempio il vettore con la posizione del centroide
-				currentDist = currentDist + pow((points[numThread*numAttributes + j] - sharedCentroids[j]), 2.0);
+			//fine tiling------------------------------------------------------------------------------------------------------
+			for (int k = 0; k < centroidTilingSize; k++){
+				currentDist = 0.0;
+				for (int j = 0; j < numAttributes; j++){//riempio il vettore con la posizione del centroide
+					currentDist = currentDist + pow(((double)points[numThread*numAttributes + j] - (double)sharedCentroids[k*numAttributes + j]), 2.0);
+				}
+				if (currentDist < minDist){
+					minDist = currentDist;
+					closerCentroidID = k + i*centroidTilingSize;
+				}
 			}
-			//currentDist = sqrt(currentDist); potrebbe non servire ?
+		}
+		int index = floor(((double)numCentroids / (double)centroidTilingSize));
+		//tiling dei centroidi rimanenti - se presenti --------------------------------------------------------------------
+		if (threadIdx.x < (numCentroids - index*centroidTilingSize)*numAttributes){
+			sharedCentroids[threadIdx.x] = centroids[index*centroidTilingSize*numAttributes + threadIdx.x];
+		}
+		__syncthreads();
+		//fine tiling------------------------------------------------------------------------------------------------------
+		for (int k = 0; k < numCentroids - centroidTilingSize*index; k++){
+			currentDist = 0.0;
+			for (int j = 0; j < numAttributes; j++){//riempio il vettore con la posizione del centroide
+				currentDist = currentDist + pow(((double)points[numThread*numAttributes + j] - (double)sharedCentroids[k*numAttributes + j]), 2.0);
+			}
 			if (currentDist < minDist){
 				minDist = currentDist;
-				closerCentroidID = i;
+				closerCentroidID = centroidTilingSize*index + k;
 			}
-		} //alla fine di questo for ho l'ID del centroide più vicino - questo va registrato sulla matrice dei link
-		//printf("\ncloserCentroi ID : %d", closerCentroidID);
+		}
+		//alla fine di questo for ho l'ID del centroide più vicino - questo va registrato sulla matrice dei link
 		linkMatrix[numThread*numCentroids + closerCentroidID] = 1;
-
-
 	}
 	//l'aggiornamento dei centroidi si fa su host, non riesco a vedere come si potrebbe risparmiare facendolo qui
 }
@@ -107,45 +118,44 @@ int main(){
 	std::vector<Centroid> centroids{};
 
 	int iterationNum = 0;
+	int toleratedFraction = 1000; //più è alto più è piccolo il numero di punti che può cambiare per dichiarare la convergenza
+	int numPtsChanged;
+	bool convergence = false;
 
-	double *ptsMatrix; //matrice dei punti (numPoints x numAttributes)
-	double *centersMatrix; //matrice dei centroidi (numCentroids x numAttributes)
+	float *ptsMatrix; //matrice dei punti (numPoints x numAttributes)
+	float *centersMatrix; //matrice dei centroidi (numCentroids x numAttributes)
 	int *linkMatrix; //matrice che descrive l'appartenenza di punti a centroidi (numCentroids x numPoints)
-	double *oldCentersMatrix; //serve per capire quando si ha convergenza
 	int *vectorIndex; //serve per il ricalcolo dei centroidi
+	int *oldLinkMatrix; //serve per il calcolo della convergenza
 
-	double *devicePtsMatrix; // versione su device
-	double *deviceCentersMatrix; //versione su device
+	float *devicePtsMatrix; // versione su device
+	float *deviceCentersMatrix; //versione su device
 	int *deviceLinkMatrix; //versione su device
 
 	int numAttributes;
 	int numPoints;
 	int numCentroids;
-
+	int centroidTilingSize = 10; //QUESTO DEVE SEMPRE ESSERE MINORE AL NUMERO DEI CENTROIDI!
 
 	FileReader* reader = new FileReader();
-	(*reader).readFile(pointsPath, &points);
+	(*reader).readFile(pointsPath, &points); //leggo i punti da file
 	(*reader).readFile(centersPath, &centroids);
 
 	numAttributes = points.at(0).numAttributes;
 	numPoints = points.size();
 	numCentroids = centroids.size();
 
-	ptsMatrix = (double*)malloc(numPoints*numAttributes*sizeof(double));
-	centersMatrix = (double*)malloc(numCentroids*numAttributes*sizeof(double));
+	ptsMatrix = (float*)malloc(numPoints*numAttributes*sizeof(float));
+	centersMatrix = (float*)malloc(numCentroids*numAttributes*sizeof(float));
 	linkMatrix = (int*)malloc(numCentroids*numPoints*sizeof(int));
+	oldLinkMatrix = (int*)malloc(numCentroids*numPoints*sizeof(int));;
 
-	oldCentersMatrix = (double*)malloc(numCentroids*numAttributes*sizeof(double));
-
-	//printf("copio i punti su matrici");
-	int start_s = clock();
+	int start_s = clock(); //registro tempi
 	//inizializzo la matrice di punti
 	for (int i = 0; i < numPoints; i++){
 		for (int j = 0; j < numAttributes; j++){
 			ptsMatrix[i*numAttributes + j] = points.at(i).attributes[j];
-			//printf("  %lf", points.at(i).attributes[j]);
 		}
-		//printf("\n");
 	}
 	//inizializzo la matrice di centroidi 
 	for (int i = 0; i < numCentroids; i++){
@@ -155,36 +165,50 @@ int main(){
 	}
 	// alloco la memoria sul device
 	CUDA_CHECK_RETURN(
-		cudaMalloc((void **)&devicePtsMatrix, sizeof(double)* numPoints * numAttributes)
+		cudaMalloc((void **)&devicePtsMatrix, sizeof(float)* numPoints * numAttributes)
 		);
-	//copio i dati dall'host alla memoria del device
+	//copio i Punti  dall'host alla memoria del device
 	CUDA_CHECK_RETURN(//poi devo provare a metterli nella constant memory
-		cudaMemcpy(devicePtsMatrix, ptsMatrix, sizeof(double)* numPoints * numAttributes, cudaMemcpyHostToDevice)
+		cudaMemcpy(devicePtsMatrix, ptsMatrix, sizeof(float)* numPoints * numAttributes, cudaMemcpyHostToDevice)
 		);
 
 
-
+	//azzero l'indice del numero di punti per centroide
+	vectorIndex = (int*)malloc(numCentroids*sizeof(int));
+	for (int i = 0; i < numCentroids; i++){
+		vectorIndex[i] = 0;
+	}
+	// ---------------------------------------------------------------------------------------------------------- 
+	// ----------------------------------------- inizia ciclo principale ----------------------------------------
+	// ----------------------------------------------------------------------------------------------------------
 	do{
-		printf("\n iterazione numero: %d \n", iterationNum);
-		//inizializzo la matrice di link
+		printf("\n iterazione esterna numero: %d \n", iterationNum);
+		//inizializzo la nuova matrice di link e la copio sulla vecchia
 		for (int i = 0; i < numPoints; i++){
 			for (int j = 0; j < numCentroids; j++){
+
+				if (iterationNum == 0){
+					oldLinkMatrix[i*numCentroids + j] = 0;
+				}
+				else{
+					oldLinkMatrix[i*numCentroids + j] = linkMatrix[i*numCentroids + j];
+				}
 				linkMatrix[i*numCentroids + j] = 0;
 			}
 		}
-		copy_matrix(centersMatrix, oldCentersMatrix, numCentroids, numAttributes);
-
+		for (int i = 0; i < numCentroids; i++){
+			vectorIndex[i] = 0;
+		}
 		// alloco la memoria sul device
 		CUDA_CHECK_RETURN(
-			cudaMalloc((void **)&deviceCentersMatrix, sizeof(double)* numCentroids * numAttributes)
+			cudaMalloc((void **)&deviceCentersMatrix, sizeof(float)* numCentroids * numAttributes)
 			);
 		CUDA_CHECK_RETURN(
 			cudaMalloc((void **)&deviceLinkMatrix, sizeof(int)* numCentroids * numPoints)
 			);
-
 		//copio i dati dall'host alla memoria del device
 		CUDA_CHECK_RETURN(
-			cudaMemcpy(deviceCentersMatrix, centersMatrix, sizeof(double)* numCentroids * numAttributes, cudaMemcpyHostToDevice)
+			cudaMemcpy(deviceCentersMatrix, centersMatrix, sizeof(float)* numCentroids * numAttributes, cudaMemcpyHostToDevice)
 			);
 		CUDA_CHECK_RETURN(//poi devo provare a metterli nella constant memory
 			cudaMemcpy(deviceLinkMatrix, linkMatrix, sizeof(int)* numCentroids * numPoints, cudaMemcpyHostToDevice)
@@ -193,11 +217,14 @@ int main(){
 		dim3 blockDim(1024, 1);
 		dim3 gridDim(ceil(numPoints / 1024.0), 1);
 
-		//esegue kernel
-		registerPointsToCentroid << <gridDim, blockDim, numAttributes*sizeof(double)>> >(devicePtsMatrix, deviceCentersMatrix, deviceLinkMatrix, numPoints, numCentroids, numAttributes);
 
+		//print_matrix(centersMatrix, numCentroids, numAttributes);
+		//-------------------------------esegue kernel----------------------------------------------------------
+		registerPointsToCentroid << <gridDim, blockDim, centroidTilingSize*numAttributes*sizeof(float) >> >
+			(devicePtsMatrix, deviceCentersMatrix, deviceLinkMatrix, numPoints, numCentroids, numAttributes, centroidTilingSize);
 		cudaDeviceSynchronize();
-
+		//-------------------------------esegue host------------------------------------------------------------
+		
 		//copio dati da device a host
 		CUDA_CHECK_RETURN(
 			cudaMemcpy(linkMatrix, deviceLinkMatrix, numCentroids*numPoints*sizeof(int), cudaMemcpyDeviceToHost)
@@ -214,16 +241,14 @@ int main(){
 				centersMatrix[i*numAttributes + j] = 0;
 			}
 		}
-		//azzero l'indice del numero di punti per centroide
-		vectorIndex = (int*)malloc(numCentroids*sizeof(int));
-		for (int i = 0; i < numCentroids; i++){
-			vectorIndex[i] = 0;
-		}
-
+		numPtsChanged = 0;
 		//sommo i valori delle posizioni di ogni punto sul corrispondente centroide
 		for (int i = 0; i < numCentroids; i++){
 			for (int j = 0; j < numPoints; j++){
 				if (linkMatrix[i + numCentroids*j] == 1){//il punto j-esimo appartiene al centroide i-esimo
+					if (oldLinkMatrix[i + numCentroids*j] == 0){//per controllo della convergenza
+						numPtsChanged++;
+					}
 					for (int k = 0; k < numAttributes; k++){
 						centersMatrix[i*numAttributes + k] += ptsMatrix[j*numAttributes + k];
 					}
@@ -239,11 +264,13 @@ int main(){
 			}
 		}
 		iterationNum++;
-		
+		printf("numero punti cambiati: %d", numPtsChanged);
+		convergence = hasConverged(numPtsChanged, numPoints, toleratedFraction);
+	} while (iterationNum<100 && !convergence);
 
-	} while(iterationNum<100 && !hasConverged(centersMatrix, oldCentersMatrix, numCentroids, numAttributes));
+
 	int stop_s = clock();
-	std::cout << "time: " << (stop_s - start_s) / double(CLOCKS_PER_SEC) << std::endl;
+	std::cout << "\ntime: " << (stop_s - start_s) / double(CLOCKS_PER_SEC) << std::endl;
 	// prova a vedere cosa succede se non svuoti le memorie del device di quei campi che restano uguali (tipo i points) e se non glieli ripassi, se va uguale risparmi tempo
 
 	print_matrix(centersMatrix, numCentroids, numAttributes);
@@ -251,7 +278,8 @@ int main(){
 	free(ptsMatrix);
 	free(centersMatrix);
 	free(linkMatrix);
-
+	free(vectorIndex);
+	free(oldLinkMatrix);
 	
 	return 0;
 }

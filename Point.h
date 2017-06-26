@@ -11,13 +11,13 @@ public:
 
 	int ID;
 	int numAttributes;
-	double* attributes;
+	float* attributes;
 
 	Point(){
 
 	}
 
-	Point(int id, int numAttribs, double* attribs){
+	Point(int id, int numAttribs, float* attribs){
 		ID = id;
 		numAttributes = numAttribs;
 		attributes = attribs;
